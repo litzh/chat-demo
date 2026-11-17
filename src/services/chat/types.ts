@@ -1,4 +1,5 @@
 import type { TranslationMessage } from '../../i18n/index.js'
+import type { GenerationOptions } from '../../../shared/preferences.js'
 import type { ApiErrorKind } from '../api/client.js'
 import type {
   ChatModel,
@@ -72,6 +73,7 @@ export type ReplyBlock = ThinkingPart | TextPart | ServerToolBlock
 export type ReplyStatus = 'pending' | 'streaming' | 'done' | 'stopped' | 'error'
 
 export type AssistantMessage = MessageBranch & {
+  options?: GenerationOptions
   id: string
   role: 'assistant'
   createdAt: number
@@ -106,6 +108,7 @@ export type AssistantMessage = MessageBranch & {
 export type Message = UserMessage | AssistantMessage
 
 export type Session = {
+  options?: Partial<GenerationOptions>
   id: string
   title: string
   createdAt: number

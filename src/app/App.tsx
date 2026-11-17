@@ -1,9 +1,11 @@
+import { ConfirmAction } from '../components/base/ConfirmAction.js'
 import { useEffect } from 'react'
 import { useTranslate } from '../i18n/index.js'
-import { useSettings } from '../services/settings.js'
+import { bindCloudSettings, useSettings } from '../services/settings.js'
 import { useIsMobile, useMobileViewport, usePreventPageScroll } from './viewport.js'
 import {
   bindChatPersistence,
+  bindCloudChat,
   initChat,
   retrySaveSessions,
   selectSession,
@@ -16,6 +18,8 @@ import { MobileHeader } from '../components/session/MobileHeader.js'
 import { Welcome } from '../components/session/Welcome.js'
 import { ensureApiKey } from '../components/settings/settingsDialogState.js'
 import { SettingsDialog } from '../components/settings/SettingsDialog.js'
+import { HistoryProgress } from '../components/settings/HistoryProgress.js'
+import { restoreHistoryProgress } from '../services/chat/backup.js'
 import { Toast } from '../components/base/Toast.js'
 import { showToast } from '../components/base/toastState.js'
 import { onUploadNotice } from '../services/attachments.js'
@@ -29,6 +33,10 @@ import styles from './App.module.css'
 export const App = () => {
   const t = useTranslate()
   const isMobile = useIsMobile()
+  const fontSize = useSettings((state) => state.fontSize)
+  useEffect(() => {
+    document.documentElement.style.setProperty('--chat-font-size', `${fontSize}px`)
+  }, [fontSize])
   const locale = useSettings((state) => state.locale)
   // 移动端侧边栏以独立抽屉管理开合状态
   const siderCollapsed = useSettings((state) => state.siderCollapsed) && !isMobile
@@ -59,6 +67,8 @@ export const App = () => {
   // 文件数、存储空间达到上限时，附件上只显示「上传失败」，原因用 toast 说明
   useEffect(() => onUploadNotice(showToast), [])
   useEffect(bindChatPersistence, [])
+  useEffect(bindCloudChat, [])
+  useEffect(bindCloudSettings, [])
 
   // 搜索结果面板只属于当前会话
   useEffect(closeSearchPanel, [activeId])
@@ -69,6 +79,7 @@ export const App = () => {
 
   useEffect(() => {
     void initChat()
+    void restoreHistoryProgress().catch(() => {})
     // 首次打开先在设置里输入 API Key
     ensureApiKey()
   }, [])
@@ -78,6 +89,7 @@ export const App = () => {
       <div ref={frameRef} className={styles.frame}>
         {isMobile ? <MobileSider /> : siderCollapsed ? null : <Sider />}
         <main className={styles.main}>
+          <HistoryProgress compact />
           {saveError ? (
             <div className={styles.saveError} role="alert">
               <span>{t('sessionSaveFailed')}</span>
@@ -134,6 +146,7 @@ export const App = () => {
       </div>
       <SettingsDialog />
       <Toast />
+      <ConfirmAction />
     </>
   )
 }

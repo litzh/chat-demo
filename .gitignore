@@ -9,3 +9,16 @@ build/
 .env.*
 !.env.example
 tmp/
+.dev.vars
+.dev.vars.*
+.wrangler/
+.test-build/
+
+.deployment-login.json
+wrangler.local.jsonc
+wrangler.jsonc
+deployment.local.*
+deepseek_data-*.zip
+dsh-backup-*.zip
+dsh-recovery-*.json
+!.dev.vars.example

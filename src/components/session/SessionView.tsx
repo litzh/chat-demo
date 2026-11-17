@@ -6,6 +6,7 @@ import { ChatInput } from '../chatInput/ChatInput.js'
 import { MessageList } from '../messages/MessageList.js'
 import { MobileHeader } from './MobileHeader.js'
 import styles from './SessionView.module.css'
+import { CloudStatus } from '../cloud/CloudStatus.js'
 
 /** 会话页：标题栏（移动端为顶栏）+ 消息列表，输入框吸底 */
 export const SessionView = ({
@@ -31,6 +32,7 @@ export const SessionView = ({
           </div>
         </div>
       )}
+      <CloudStatus id={session.id} />
       <MessageList
         session={session}
         streaming={streaming}

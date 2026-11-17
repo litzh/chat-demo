@@ -1,4 +1,6 @@
-# 历史导入导出
+# 上游历史格式兼容说明
+
+> 本目录保留上游 Demo 的格式转换实现。以下是上游格式说明；DSH Chat 当前采用追加导入与完整备份，运行规则见 [项目说明](../../../../README.md)。
 
 chat-demo 使用 `export_format_version: 3` 的历史会话 ZIP，导出文件名为 `deepseek_data-日期.zip`。字段定义见 [format.ts](./format.ts)，实际校验规则见 [schema.ts](./schema.ts)。
 

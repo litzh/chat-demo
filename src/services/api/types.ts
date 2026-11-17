@@ -178,8 +178,13 @@ export type CreateMessageRequest = {
   messages: MessageParam[]
   thinking: { type: 'enabled' | 'disabled' }
   tools: (DeepseekWebSearchTool | DeepseekReadUrlTool)[]
-  safety_check: { level: 'high' }
+  safety_check?: { level: 'high' | 'low' }
   title?: { enabled: boolean }
+  output_config?: { effort: 'low' | 'high' | 'max' }
+  max_tokens?: number
+  temperature?: number
+  top_p?: number
+  stop_sequences?: string[]
 }
 
 // ---------- 响应：流式事件 ----------
@@ -237,7 +242,7 @@ export type MessageStreamEvent =
  * POST /anthropic/v1/files 的 purpose：PDF 与 Word、PPT 需要服务端做版面解析；
  * 纯文本、代码、表格与电子书不需要解析，用 user_data。
  */
-export type FilePurpose = 'rich_layout_recognition' | 'user_data'
+export type FilePurpose = 'text_recognition' | 'rich_layout_recognition' | 'user_data'
 
 /** POST /anthropic/v1/files 的响应 */
 export type FileObject = {

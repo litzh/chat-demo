@@ -4,13 +4,14 @@ import { uploadFile } from './api/client.js'
 import { classifyApiError, getUploadErrorInfo, isRetryableApiError } from './api/errors.js'
 import type { FilePurpose } from './api/types.js'
 import { ACCEPT_FILE_EXTS } from './uploadExts.js'
+import { useSettings } from './settings.js'
 
 /** 允许上传的扩展名，按扩展名白名单过滤，清单见 uploadExts.ts */
 export const ACCEPTED_EXTS = ACCEPT_FILE_EXTS
 /** 选择文件对话框的过滤条件 */
 export const ACCEPT = ACCEPTED_EXTS.map((ext) => `.${ext}`).join(',')
 /** 单文件大小上限与 Files API 一致 */
-export const MAX_SIZE_MB = 64
+export const MAX_SIZE_MB = 100
 /** 按 user_data 上传的文件（纯文本、代码、表格、电子书）原文件上限更小 */
 export const MAX_USER_DATA_SIZE_MB = 32
 export const MAX_COUNT = 50
@@ -33,14 +34,18 @@ export const getUploadPurpose = (name: string, isImage: boolean): FilePurpose | 
   if (isImage) {
     return null
   }
-  return LAYOUT_RECOGNITION_EXTS.has(getFileExt(name)) ? 'rich_layout_recognition' : 'user_data'
+  return LAYOUT_RECOGNITION_EXTS.has(getFileExt(name))
+    ? useSettings.getState().documentPurpose
+    : 'user_data'
 }
 
 /** 文件允许的最大体积（MB），按上传时的 purpose 区分 */
 const getMaxSizeMB = (file: File) =>
-  getUploadPurpose(file.name, isImage(resolveMimeType(file))) === 'user_data'
-    ? MAX_USER_DATA_SIZE_MB
-    : MAX_SIZE_MB
+  isImage(resolveMimeType(file))
+    ? 64
+    : getUploadPurpose(file.name, false) === 'user_data'
+      ? MAX_USER_DATA_SIZE_MB
+      : MAX_SIZE_MB
 
 /** 添加前校验：格式 → 大小 → 数量，任一不满足即整批不添加 */
 export const validateFiles = (files: File[], currentCount: number): TranslationMessage | null => {

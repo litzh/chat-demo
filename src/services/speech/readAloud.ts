@@ -1,3 +1,4 @@
+import { splitSpeechText } from './textLimit.js'
 import { create } from 'zustand'
 import type { TranslationMessage } from '../../i18n/index.js'
 import { ApiError } from '../api/client.js'
@@ -80,7 +81,8 @@ export const describeReadAloudError = (error: unknown): TranslationMessage | str
 export const toggleReadAloud = (
   messageId: string,
   text: string,
-  onError: (error: unknown) => void
+  onError: (error: unknown) => void,
+  incoming?: ReadableStream<Uint8Array>
 ) => {
   const reading = useReadAloud.getState().messageId
   stopReadAloud()
@@ -88,7 +90,10 @@ export const toggleReadAloud = (
     return
   }
   const controller = new AbortController()
-  const context = new AudioContext({ sampleRate: TTS_SAMPLE_RATE })
+  const context =
+    primed && primed.state !== 'closed' ? primed : new AudioContext({ sampleRate: TTS_SAMPLE_RATE })
+  primed = null
+  void context.resume().catch(() => {})
   current = { controller, context }
   useReadAloud.setState({ messageId, status: 'loading' })
   // 音色在开始朗读时读取，设置中切换后下一次朗读生效
@@ -99,7 +104,7 @@ export const toggleReadAloud = (
     let lastSource: AudioBufferSourceNode | null = null
     let rest = new Uint8Array(0)
     try {
-      const stream = await synthesize(apiKey ?? '', text, ttsVoice, controller.signal)
+      const stream = incoming ?? (await synthesize(apiKey ?? '', text, ttsVoice, controller.signal))
       const reader = stream.getReader()
       controller.signal.addEventListener('abort', () => void reader.cancel().catch(() => {}))
       for (;;) {
@@ -129,7 +134,7 @@ export const toggleReadAloud = (
           useReadAloud.setState({ status: 'playing' })
         }
       }
-      if (lastSource) {
+      if (lastSource && nextTime > context.currentTime) {
         lastSource.onended = () => finish(controller)
       } else {
         finish(controller)
@@ -141,4 +146,162 @@ export const toggleReadAloud = (
       }
     }
   })()
+}
+
+/** Called synchronously from Send so mobile browsers can unlock audio. */
+let primed: AudioContext | null = null
+export function primeReadAloud() {
+  if (!useSettings.getState().autoRead) {
+    return
+  }
+  if (primed && primed.state !== 'closed') {
+    return
+  }
+  primed = new AudioContext({ sampleRate: TTS_SAMPLE_RATE })
+  void primed.resume().catch(() => {})
+}
+
+/** Browser-authenticated WebSocket: no API credential passes through our Worker. */
+export function beginStreamingRead(messageId: string, onError: (error: unknown) => void) {
+  let socket: WebSocket | null = null,
+    previous = '',
+    pending = '',
+    finished = false,
+    closed = false
+  let sink: ReadableStreamDefaultController<Uint8Array> | null = null
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const resetTimer = () => {
+    clearTimeout(timer)
+    timer = setTimeout(() => fail(new Error('流式朗读连接超时')), 60_000)
+  }
+  const fail = (error: Error) => {
+    if (closed) {
+      return
+    }
+    closed = true
+    clearTimeout(timer)
+    sink?.error(error)
+    socket?.close()
+  }
+  const send = () => {
+    if (socket?.readyState !== WebSocket.OPEN || closed) {
+      return
+    }
+    if (pending && (finished || /[。！？.!?\n]/.test(pending) || pending.length >= 80)) {
+      socket.send(JSON.stringify({ event: 'text', text: pending }))
+      pending = ''
+      resetTimer()
+    }
+    if (finished) {
+      socket.send(JSON.stringify({ event: 'finish_text' }))
+    }
+  }
+  const stream = new ReadableStream<Uint8Array>({
+    start(controller) {
+      sink = controller
+    },
+    cancel() {
+      closed = true
+      clearTimeout(timer)
+      socket?.close()
+    },
+  })
+  const start = () => {
+    const { apiKey, ttsVoice, ttsFilterMarkdown } = useSettings.getState()
+    if (!apiKey) {
+      fail(new Error('请先填写 API Key'))
+      return
+    }
+    const url = new URL('https://api.deepseek.com/v1/tools/tts')
+    url.protocol = 'wss:'
+    url.search = new URLSearchParams({
+      voice_id: ttsVoice,
+      format: 'pcm',
+      filter_markdown: String(ttsFilterMarkdown),
+    }).toString()
+    socket = new WebSocket(url, ['tts', `bearer.${apiKey}`])
+    socket.binaryType = 'arraybuffer'
+    resetTimer()
+    socket.onopen = send
+    socket.onmessage = (event) => {
+      if (closed) {
+        return
+      }
+      resetTimer()
+      if (event.data instanceof ArrayBuffer) {
+        sink?.enqueue(new Uint8Array(event.data))
+      } else {
+        try {
+          const data = JSON.parse(String(event.data))
+          if (data.event === 'finish' && data.code === 'success') {
+            closed = true
+            clearTimeout(timer)
+            sink?.close()
+            socket?.close()
+          } else if (data.event === 'finish' || data.error) {
+            fail(new Error(data.message ?? JSON.stringify(data)))
+          }
+        } catch (error) {
+          fail(error instanceof Error ? error : new Error('朗读响应无效'))
+        }
+      }
+    }
+    socket.onerror = () => fail(new Error('无法连接 DeepSeek 流式语音服务'))
+    socket.onclose = () => {
+      if (!closed) {
+        fail(new Error('流式朗读连接意外中断'))
+      }
+    }
+    toggleReadAloud(messageId, '', onError, stream)
+  }
+  return {
+    update(text: string) {
+      if (closed || finished) {
+        return
+      }
+      if (!text.startsWith(previous)) {
+        this.stop()
+        return
+      }
+      const chunks = splitSpeechText(text)
+      const clipped = chunks[0] ?? ''
+      pending += clipped.slice(previous.length)
+      previous = clipped
+      if (pending && !socket) {
+        start()
+      }
+      if (chunks.length > 1) {
+        finished = true
+        onError(new Error('本次流式朗读达到 1 万计费字符上限，余下文字可在回答完成后手动朗读'))
+      }
+      send()
+    },
+    finish() {
+      if (finished || closed) {
+        return
+      }
+      finished = true
+      if (socket) {
+        send()
+      } else {
+        closed = true
+        sink?.close()
+      }
+    },
+    stop() {
+      if (useReadAloud.getState().messageId === messageId) {
+        stopReadAloud()
+      }
+      if (closed) {
+        return
+      }
+      closed = true
+      clearTimeout(timer)
+      socket?.close()
+      sink?.close()
+      if (useReadAloud.getState().messageId === messageId) {
+        stopReadAloud()
+      }
+    },
+  }
 }

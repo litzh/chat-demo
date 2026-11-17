@@ -416,6 +416,30 @@
   color: var(--dsw-alias-label-primary);
 }
 
+.historyProgress {
+  padding: 12px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+  flex-shrink: 0;
+  border-bottom: 1px solid var(--dsw-alias-border-standard);
+  overflow-wrap: anywhere;
+  font-size: 14px;
+}
+.historyProgress progress {
+  width: 100%;
+  accent-color: #4d6bfe;
+}
+.historyProgress small {
+  opacity: 0.7;
+}
+.historyActions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
 .deleteConfirm {
   max-height: calc(100dvh - 32px);
   overflow-y: auto;
@@ -438,5 +462,17 @@
     white-space: normal;
     overflow-wrap: anywhere;
     max-width: 100%;
+  }
+}
+
+@media (max-width: 600px) {
+  .navItem {
+    min-width: 0;
+    flex: 1;
+    padding-inline: 5px;
+    font-size: 13px;
+  }
+  .navItem svg {
+    display: none;
   }
 }

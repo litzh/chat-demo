@@ -1,5 +1,6 @@
 import clsx from 'clsx'
-import { memo, useCallback, useEffect, useLayoutEffect, useRef } from 'react'
+import { memo, useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react'
+import { canWrite, useCloud } from '../../services/cloud/client.js'
 import {
   IconGlobeLanguageOutline14,
   IconPaperclipOutline16,
@@ -9,7 +10,12 @@ import {
 } from '../base/icons.js'
 import { setSearch, setThinking, useSettings } from '../../services/settings.js'
 import { useIsMobile } from '../../app/viewport.js'
-import { sendMessage, stopReply, useChatStore } from '../../services/chat/store.js'
+import {
+  sendMessage,
+  stopReply,
+  useChatStore,
+  setSessionOptions,
+} from '../../services/chat/store.js'
 import {
   addDraftFiles,
   EMPTY_DRAFT,
@@ -20,7 +26,7 @@ import {
   setDraftText,
   useDrafts,
 } from '../../services/chat/drafts.js'
-import { stopReadAloud } from '../../services/speech/readAloud.js'
+import { stopReadAloud, primeReadAloud } from '../../services/speech/readAloud.js'
 import { IconButton } from '../base/IconButton.js'
 import { Tooltip } from '../base/Tooltip.js'
 import { ensureApiKey } from '../settings/settingsDialogState.js'
@@ -41,6 +47,8 @@ export const ChatInput = memo(function ChatInput({ sessionId }: { sessionId: str
 })
 
 const Input = ({ sessionId }: { sessionId: string | null }) => {
+  const [sending, setSending] = useState(false)
+  const writable = useCloud(() => canWrite(sessionId))
   const t = useTranslate()
   const draft = useDrafts((state) => state.drafts.get(sessionId) ?? EMPTY_DRAFT)
   const { text, attachments } = draft
@@ -49,10 +57,15 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
   const streaming = useChatStore(
     (state) => sessionId !== null && Object.hasOwn(state.streaming, sessionId)
   )
-  const thinking = useSettings((state) => state.thinking)
+  const overrides = useChatStore((state) =>
+    sessionId ? state.sessionCache[sessionId]?.options : undefined
+  )
+  const globalThinking = useSettings((state) => state.thinking)
+  const thinking = overrides?.thinking ?? globalThinking
   const importingHistory = useChatStore((state) => state.importingHistory)
   const isMobile = useIsMobile()
-  const search = useSettings((state) => state.search)
+  const globalSearch = useSettings((state) => state.search)
+  const search = overrides?.search ?? globalSearch
   const fileInputRef = useRef<HTMLInputElement>(null)
   const textareaRef = useRef<HTMLTextAreaElement>(null)
   const togglesRef = useRef<HTMLDivElement>(null)
@@ -75,7 +88,12 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
   }, [t])
 
   const acceptFiles = (files: File[]) => {
-    if (files.length === 0 || useChatStore.getState().importingHistory || !ensureApiKey()) {
+    if (
+      !canWrite(sessionId) ||
+      files.length === 0 ||
+      useChatStore.getState().importingHistory ||
+      !ensureApiKey()
+    ) {
       return
     }
     const error = addDraftFiles(sessionId, files, useSettings.getState().apiKey ?? '')
@@ -130,10 +148,13 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
   const recording = voice.status === 'recording'
 
   // 排队、上传中或上传失败的附件都留在输入框，全部上传成功后才能发送
-  const canSend = !importingHistory && !streaming && voice.status === 'idle' && draftReady
+  const canSend =
+    writable && !sending && !importingHistory && !streaming && voice.status === 'idle' && draftReady
 
-  const send = () => {
+  const send = async () => {
     if (
+      sending ||
+      !canWrite(sessionId) ||
       useChatStore.getState().importingHistory ||
       voice.status !== 'idle' ||
       !prepareDraftMessage(getDraft(sessionId), useUploads.getState().tasks)
@@ -141,8 +162,17 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
       return
     }
     // 文本与上传完成态由提交动作读取最新快照，不使用上一次渲染的草稿。
-    if (!ensureApiKey() || !sendMessage(sessionId)) {
+    if (!ensureApiKey()) {
       return
+    }
+    primeReadAloud()
+    setSending(true)
+    try {
+      if (!(await sendMessage(sessionId))) {
+        return
+      }
+    } finally {
+      setSending(false)
     }
     stopReadAloud()
     if (isMobile) {
@@ -170,7 +200,7 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
           rows={2}
           // 移动端不自动聚焦，避免一打开就弹出键盘
           autoFocus={!isMobile}
-          disabled={importingHistory}
+          disabled={importingHistory || !writable}
           value={text}
           onChange={(event) => setText(event.target.value)}
           onMouseDown={(event) => {
@@ -208,7 +238,12 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
               className={clsx(styles.toggle, thinking && styles.selected)}
               aria-label={t('thinkingSwitch')}
               aria-pressed={thinking}
-              onClick={() => setThinking(!thinking)}
+              disabled={!writable || streaming}
+              onClick={() =>
+                sessionId && overrides?.thinking !== undefined
+                  ? setSessionOptions(sessionId, { ...overrides, thinking: !thinking })
+                  : setThinking(!thinking)
+              }
             >
               <IconThinkOutline14 />
               <span className={styles.toggleLabel}>{t('thinkingSwitch')}</span>
@@ -220,7 +255,12 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
               className={clsx(styles.toggle, search && styles.selected)}
               aria-label={t('search')}
               aria-pressed={search}
-              onClick={() => setSearch(!search)}
+              disabled={!writable || streaming}
+              onClick={() =>
+                sessionId && overrides?.search !== undefined
+                  ? setSessionOptions(sessionId, { ...overrides, search: !search })
+                  : setSearch(!search)
+              }
             >
               <IconGlobeLanguageOutline14 />
               <span className={styles.toggleLabel}>{t('search')}</span>
@@ -230,7 +270,7 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
         <div className={styles.right}>
           <VoiceButton
             status={voice.status}
-            disabled={!voice.available}
+            disabled={!voice.available || !writable}
             seconds={voice.seconds}
             onClick={() => {
               if (
@@ -246,7 +286,7 @@ const Input = ({ sessionId }: { sessionId: string | null }) => {
             tone="primary"
             icon={<IconPaperclipOutline16 />}
             tooltip={t('uploadFile')}
-            disabled={importingHistory}
+            disabled={importingHistory || !writable}
             onClick={() => ensureApiKey() && fileInputRef.current?.click()}
           />
           <input

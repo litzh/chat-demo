@@ -1,5 +1,6 @@
 import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react'
 import { useIsMobile } from '../../app/viewport.js'
+import { canWrite, useCloud } from '../../services/cloud/client.js'
 import {
   buildMessageVersions,
   getVisibleMessages,
@@ -42,6 +43,7 @@ export const MessageList = ({
   streaming: boolean
   footer: React.ReactNode
 }) => {
+  const writable = useCloud(() => canWrite(session.id))
   const isMobile = useIsMobile()
   const scrollRef = useRef<HTMLDivElement>(null)
   const contentRef = useRef<HTMLDivElement>(null)
@@ -155,7 +157,7 @@ export const MessageList = ({
                   retryUploadId={uploadRetryId}
                   isFirst={index === 0}
                   isLast={index === lastIndex || index === lastIndex - 1}
-                  busy={streaming}
+                  busy={streaming || !writable}
                   versions={versions.get(message.id) ?? EMPTY_VERSIONS}
                   onSelectVersion={selectVersion}
                 />
@@ -166,7 +168,7 @@ export const MessageList = ({
                   message={message}
                   isLast={index === lastIndex}
                   streaming={streaming && index === lastIndex}
-                  busy={streaming}
+                  busy={streaming || !writable}
                   versions={versions.get(message.id) ?? EMPTY_VERSIONS}
                   onSelectVersion={selectVersion}
                 />

@@ -14,8 +14,25 @@ const formatPublishedAt = (value: string | null) => (value ? (formatDate(value, 
 export const SourceCard = ({ source, className }: { source: Source; className?: string }) => {
   const date = formatPublishedAt(source.publishedAt)
   return (
-    <a className={styles.anchor} href={source.url} target="_blank" rel="noreferrer">
+    <a
+      className={styles.anchor}
+      href={/^https?:\/\//i.test(source.url) ? source.url : undefined}
+      target="_blank"
+      rel="noreferrer"
+    >
       <div className={clsx(styles.card, className)}>
+        {source.imageUrl && (
+          <img
+            src={source.imageUrl}
+            alt={source.title}
+            loading="lazy"
+            referrerPolicy="no-referrer"
+            style={{ width: '100%', maxHeight: 200, objectFit: 'contain', borderRadius: 8 }}
+            onError={(event) => {
+              event.currentTarget.style.display = 'none'
+            }}
+          />
+        )}
         <div className={styles.meta}>
           <SiteLogo url={source.siteIcon} className={styles.siteIcon} />
           {source.siteName ? <span className={styles.siteName}>{source.siteName}</span> : null}

@@ -138,6 +138,23 @@ export const AssistantMessage = memo(function AssistantMessage({
           </span>
         </div>
       ) : null}
+      {!streaming && (message.usage || message.options) && (
+        <details className="message-usage">
+          <summary>
+            用量与请求参数
+            {message.usage
+              ? ` · 输入 ${message.usage.input_tokens ?? 0} / 输出 ${message.usage.output_tokens ?? 0} Token`
+              : ''}
+          </summary>
+          <pre className="tool-result">
+            {JSON.stringify(
+              { model: message.model, usage: message.usage, options: message.options },
+              null,
+              2
+            )}
+          </pre>
+        </details>
+      )}
       {streaming ? null : (
         <div className={styles.bottom}>
           <BranchSwitcher versions={versions} disabled={busy} onSelect={onSelectVersion} />

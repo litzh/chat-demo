@@ -1,5 +1,6 @@
 import { translate, type TranslationMessage } from '../../i18n/index.js'
 import { readMessageEvent } from './parseEvent.js'
+import { useSettings } from '../settings.js'
 import { readServerSentEvents } from './sse.js'
 import type {
   ApiErrorBody,
@@ -111,6 +112,11 @@ export const uploadFile = async (
   const form = new FormData()
   if (purpose) {
     form.append('purpose', purpose)
+  }
+  const hours = useSettings.getState().fileExpiryHours
+  if (hours > 0) {
+    form.append('expires_after[anchor]', 'created_at')
+    form.append('expires_after[seconds]', String(hours * 3600))
   }
   form.append('file', file)
   const response = await request(`${ANTHROPIC_BASE_URL}/files`, {

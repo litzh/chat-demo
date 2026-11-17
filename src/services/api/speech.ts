@@ -1,3 +1,5 @@
+import { splitSpeechText } from '../speech/textLimit.js'
+import { useSettings } from '../settings.js'
 import { ApiError, API_ORIGIN, request } from './client.js'
 
 /**
@@ -20,7 +22,7 @@ export const transcribe = async (
   signal?: AbortSignal
 ): Promise<string> => {
   const form = new FormData()
-  form.append('file', audio, 'recording.wav')
+  form.append('file', audio, audio.type.includes('ogg') ? 'recording.ogg' : 'recording.wav')
   const response = await request(`${TOOLS_BASE_URL}/asr`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${apiKey}` },
@@ -52,14 +54,55 @@ export const synthesize = async (
   voice: TtsVoice,
   signal: AbortSignal
 ): Promise<ReadableStream<Uint8Array>> => {
-  const response = await request(`${TOOLS_BASE_URL}/tts`, {
-    method: 'POST',
-    headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ text, voice_id: voice, format: 'pcm', filter_markdown: true }),
-    signal,
-  })
-  if (!response.body) {
-    throw new ApiError('protocol', await response.text())
+  const parts = splitSpeechText(text)
+  if (!parts.length) {
+    throw new Error('没有可朗读的文字')
   }
-  return response.body
+  let reader: ReadableStreamDefaultReader<Uint8Array> | undefined
+  const openNext = async () => {
+    const response = await request(`${TOOLS_BASE_URL}/tts`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        text: parts.shift(),
+        voice_id: voice,
+        format: 'pcm',
+        filter_markdown: useSettings.getState().ttsFilterMarkdown,
+      }),
+      signal,
+    })
+    if (!response.body) {
+      throw new ApiError('protocol', await response.text())
+    }
+    return response.body.getReader()
+  }
+  return new ReadableStream<Uint8Array>({
+    async pull(controller) {
+      try {
+        for (;;) {
+          signal.throwIfAborted()
+          if (!reader) {
+            if (!parts.length) {
+              controller.close()
+              return
+            }
+            reader = await openNext()
+          }
+          const { done, value } = await reader.read()
+          if (done) {
+            reader.releaseLock()
+            reader = undefined
+            continue
+          }
+          controller.enqueue(value)
+          return
+        }
+      } catch (error) {
+        controller.error(error)
+      }
+    },
+    async cancel() {
+      await reader?.cancel().catch(() => {})
+    },
+  })
 }

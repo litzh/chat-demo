@@ -1,4 +1,23 @@
+import { beginStreamingRead, toggleReadAloud } from '../speech/readAloud.js'
 import { create } from 'zustand'
+import {
+  acquireSession,
+  bindLeases,
+  canWrite,
+  CloudError,
+  createCloudSession,
+  deleteCloudSession,
+  listCloudSessions,
+  readCloudSession,
+  releaseSession,
+  renewSession,
+  saveCloudSession,
+  uploadCloudFile,
+  useCloud,
+  waitCloudSave,
+} from '../cloud/client.js'
+import { showToast } from '../../components/base/toastState.js'
+import { generationOptions, type GenerationOptions } from '../../../shared/preferences.js'
 import { createId } from '../../utils/id.js'
 import { ApiError, streamMessage } from '../api/client.js'
 import type { ChatModel, CreateMessageRequest } from '../api/types.js'
@@ -34,22 +53,19 @@ import {
 
 /** deepseek-flash 同时支持深度思考与图片输入 */
 const MODEL: ChatModel = 'deepseek-flash'
-/** 所有生成请求统一携带的助手身份说明 */
-const SYSTEM_PROMPT = '该助手为DeepSeek，由深度求索公司创造。'
 /** 保留最近打开的详情；当前会话、生成中及尚未成功保存的会话不淘汰。 */
 const SESSION_CACHE_LIMIT = 5
-/** 安全审核固定开启，所有请求都走扩展模式 */
-const SAFETY_CHECK = { level: 'high' } as const
 /** 服务端判定 file_id 失效后，重新补传并重发的最多次数（不含首次请求） */
 const FILE_RETRY_LIMIT = 2
 /** 退避基数，第 n 次重试等待 2^n 倍；连续失败达到上限就放弃，把原始报错展示出来 */
 const FILE_RETRY_BASE_DELAY = 1000
 
 /** 阅读链接始终开启，智能搜索开关控制是否另行声明搜索工具（含边想边搜）。 */
-const serverTools = (search: boolean): CreateMessageRequest['tools'] => {
-  const tools: CreateMessageRequest['tools'] = [
-    { type: 'deepseek_read_url', name: 'deepseek_read_url' },
-  ]
+const serverTools = (search: boolean, readLinks: boolean): CreateMessageRequest['tools'] => {
+  const tools: CreateMessageRequest['tools'] = []
+  if (readLinks) {
+    tools.push({ type: 'deepseek_read_url', name: 'deepseek_read_url' })
+  }
   if (search) {
     tools.push({ type: 'deepseek_web_search', name: 'deepseek_web_search' })
   }
@@ -112,6 +128,7 @@ const pendingFiles = new Map<string, db.StoredFile[]>()
 const deletingSessions = new Set<string>()
 const deletionTasks = new Set<Promise<boolean>>()
 const streamFlushes = new Map<string, () => void>()
+const persistenceTasks = new Map<string, Set<Promise<void>>>()
 let accessSequence = 0
 let historyEpoch = 0
 let initTask: Promise<void> | undefined
@@ -188,14 +205,39 @@ const persist = (sessionId: string) => {
     }
     const epoch = historyEpoch
     const files = pendingFiles.get(sessionId)
-    void db
+    const task = db
       .saveSession(session, files)
-      .then(() => {
+      .then(async () => {
         if (epoch !== historyEpoch || !getSession(sessionId)) {
           return
         }
         if (pendingFiles.get(sessionId) === files) {
           pendingFiles.delete(sessionId)
+        }
+        if (canWrite(sessionId)) {
+          await db
+            .saveRecovery(session)
+            .then(() =>
+              saveCloudSession(session, async () => {
+                const ids = new Set(
+                  session.messages.flatMap((m) =>
+                    m.role === 'user' ? m.files.map((f) => f.id) : []
+                  )
+                )
+                for (const id of ids) {
+                  const blob = await db.loadLocalFile(id)
+                  if (blob) {
+                    await uploadCloudFile(id, blob)
+                  }
+                }
+              })
+            )
+            .then(() => {
+              if (getSession(sessionId) === session) {
+                void db.clearRecovery(sessionId)
+              }
+            })
+            .catch(() => {})
         }
         if (getSession(sessionId) === session) {
           unsavedSessions.delete(sessionId)
@@ -215,6 +257,151 @@ const persist = (sessionId: string) => {
           }))
         }
       })
+    const tasks = persistenceTasks.get(sessionId) ?? new Set<Promise<void>>()
+    tasks.add(task)
+    persistenceTasks.set(sessionId, tasks)
+    void task.finally(() => {
+      tasks.delete(task)
+      if (!tasks.size) {
+        persistenceTasks.delete(sessionId)
+      }
+    })
+  }
+}
+
+const closingSessions = new Map<string, Promise<void>>()
+function closeSession(id: string): Promise<void> {
+  const existing = closingSessions.get(id)
+  if (existing) {
+    return existing
+  }
+  const task = closeOwnedSession(id).finally(() => closingSessions.delete(id))
+  closingSessions.set(id, task)
+  return task
+}
+async function closeOwnedSession(id: string) {
+  getStreamController(id)?.abort()
+  await waitForIdle(id)
+  await Promise.all([...(persistenceTasks.get(id) ?? [])])
+  await waitCloudSave(id).catch(() => {})
+  await releaseSession(id)
+}
+
+export async function takeSessionControl(id: string, takeover = false) {
+  try {
+    await closingSessions.get(id)
+    if (getStreamController(id)) {
+      getStreamController(id)?.abort()
+      await waitForIdle(id)
+    }
+    await Promise.all([...(persistenceTasks.get(id) ?? [])])
+    const latest = await acquireSession(id, takeover)
+    if (get().activeId !== id) {
+      await releaseSession(id)
+      return
+    }
+    sessionLoads.delete(id)
+    const session = settleInterrupted(normalizeSession(latest))
+    set((state) => ({
+      sessionCache: { ...state.sessionCache, [id]: session },
+      sessionLoadErrors: { ...state.sessionLoadErrors, [id]: false },
+    }))
+    await db.saveSession(session)
+    if (session !== latest) {
+      persist(id)
+    }
+  } catch (error) {
+    if (!(error instanceof CloudError && error.status === 423)) {
+      showToast(error instanceof Error ? error.message : '获取操作权失败')
+    }
+  }
+}
+
+export function setSessionOptions(id: string, options: Partial<GenerationOptions>) {
+  if (!canWrite(id)) {
+    return
+  }
+  updateSession(id, (session) => ({ ...session, options }))
+  persist(id)
+}
+
+export async function refreshCloudSessions() {
+  if (get().importingHistory) {
+    return
+  }
+  const { sessions } = await listCloudSessions()
+  set({ sessions: sortSessions(sessions) })
+  await db.saveSummaries(sessions)
+  const id = get().activeId
+  if (!id || canWrite(id) || useCloud.getState().busy[id]) {
+    return
+  }
+  if (!sessions.some((s) => s.id === id)) {
+    set({ activeId: null })
+    return
+  }
+  const remote = await readCloudSession(id)
+  if (get().activeId !== id || canWrite(id) || useCloud.getState().busy[id]) {
+    return
+  }
+  sessionLoads.delete(id)
+  set((state) => ({
+    sessionCache: { ...state.sessionCache, [id]: normalizeSession(remote.session) },
+  }))
+  useCloud.setState((state) => ({ owners: { ...state.owners, [id]: remote.lockOwner ?? '' } }))
+  await db.saveSession(remote.session)
+}
+
+export function bindCloudChat() {
+  const unbind = bindLeases()
+  let disposed = false,
+    polling = false
+  const lost = (event: Event) => {
+    const id = (event as CustomEvent<string>).detail
+    streamFlushes.get(id)?.()
+    const local = getSession(id)
+    if (local) {
+      void db.saveRecovery(local)
+    }
+    getStreamController(id)?.abort()
+  }
+  const poll = async () => {
+    if (disposed || polling || document.visibilityState !== 'visible') {
+      return
+    }
+    polling = true
+    try {
+      await refreshCloudSessions()
+    } catch {
+      /* cached history remains available */
+    } finally {
+      polling = false
+    }
+  }
+  let tick = 0
+  const interval = setInterval(() => {
+    tick++
+    if (tick % useSettings.getState().syncInterval === 0) {
+      void poll()
+    }
+    if (tick % 5 === 0) {
+      for (const id of Object.keys(get().streaming)) {
+        streamFlushes.get(id)?.()
+        if (canWrite(id)) {
+          persist(id)
+        }
+      }
+    }
+  }, 1000)
+  const focus = () => void poll()
+  window.addEventListener('focus', focus)
+  window.addEventListener('dsh-lock-lost', lost)
+  return () => {
+    disposed = true
+    clearInterval(interval)
+    unbind()
+    window.removeEventListener('focus', focus)
+    window.removeEventListener('dsh-lock-lost', lost)
   }
 }
 
@@ -255,12 +442,18 @@ export const bindChatPersistence = () => {
 
 /** 按当前开关创建回复：深度思考对应 thinking，智能搜索控制 deepseek_web_search。 */
 const createReply = (): AssistantMessage => {
-  const { thinking, search } = useSettings.getState()
+  const activeId = get().activeId
+  const options = generationOptions({
+    ...useSettings.getState(),
+    ...(activeId ? getSession(activeId)?.options : {}),
+  })
+  const { thinking, search } = options
   return {
     id: createId(),
     role: 'assistant',
     createdAt: Date.now(),
-    model: MODEL,
+    model: options.model,
+    options,
     thinking,
     search,
     prefix: true,
@@ -299,7 +492,14 @@ export const initChat = (): Promise<void> => {
   set({ initError: false })
   initTask = (async () => {
     try {
-      const summaries = await db.loadSessionSummaries()
+      let summaries: SessionSummary[]
+      try {
+        const remote = await listCloudSessions()
+        summaries = remote.sessions
+        await db.saveSummaries(summaries)
+      } catch {
+        summaries = await db.loadSessionSummaries()
+      }
       if (epoch === historyEpoch) {
         set({ ready: true, sessions: sortSessions(summaries) })
       }
@@ -332,7 +532,9 @@ const ensureSessionLoaded = (id: string): Promise<void> => {
   sessionLoads.set(id, load)
   load.promise = (async () => {
     try {
-      const stored = await db.loadSession(id)
+      const stored = await readCloudSession(id)
+        .then((result) => result.session)
+        .catch(() => db.loadSession(id))
       if (epoch !== historyEpoch || sessionLoads.get(id) !== load) {
         return
       }
@@ -343,14 +545,12 @@ const ensureSessionLoaded = (id: string): Promise<void> => {
       if (!stored) {
         throw new Error(`Session ${id} is missing from local storage`)
       }
-      const settled = settleInterrupted(normalizeSession(stored))
+      const settled = normalizeSession(stored)
       // 读取期间可能已在列表重命名，保留最新元数据，不能让旧读取覆盖它。
       const session = sameSummary(settled, summary) ? settled : { ...settled, ...summary }
       touchSession(id)
       set((state) => ({ sessionCache: { ...state.sessionCache, [id]: session } }))
-      if (session !== stored) {
-        persist(id)
-      }
+      void db.saveSession(session)
       trimSessionCache()
     } catch (error) {
       if (epoch === historyEpoch && sessionLoads.get(id) === load) {
@@ -384,6 +584,38 @@ const waitForIdle = (sessionId?: string) =>
       }
     })
   })
+
+/** Bulk deletion pauses local writes; the server checks leases atomically without downloading snapshots. */
+export const prepareHistoryDeletion = async () => {
+  set({ importingHistory: true })
+  for (const controller of Object.values(get().streaming)) {
+    controller.abort()
+  }
+  await waitForIdle()
+  await Promise.all(deletionTasks)
+  await Promise.all(
+    Object.keys(useCloud.getState().locks).map((id) => waitCloudSave(id).catch(() => {}))
+  )
+}
+export const forgetDeletedSessions = async (ids: string[]) => {
+  const deleted = new Set(ids)
+  for (const id of ids) {
+    sessionLoads.delete(id)
+    sessionAccess.delete(id)
+    unsavedSessions.delete(id)
+    pendingFiles.delete(id)
+    clearDraft(id)
+    await db.deleteSession(id)
+    await db.clearRecovery(id)
+  }
+  set((state) => ({
+    sessions: state.sessions.filter((s) => !deleted.has(s.id)),
+    sessionCache: Object.fromEntries(
+      Object.entries(state.sessionCache).filter(([id]) => !deleted.has(id))
+    ),
+    activeId: state.activeId && deleted.has(state.activeId) ? null : state.activeId,
+  }))
+}
 
 /**
  * 替换历史对话：先写入暂存，成功后原子替换旧记录；写入为空即删除全部会话与附件。
@@ -442,6 +674,10 @@ export const replaceHistory = async (write: () => Promise<void>): Promise<number
 
 export const newChat = () => {
   if (!get().importingHistory) {
+    const previous = get().activeId
+    if (previous) {
+      void closeSession(previous)
+    }
     set({ activeId: null })
     trimSessionCache()
   }
@@ -449,15 +685,25 @@ export const newChat = () => {
 
 export const selectSession = (id: string) => {
   if (!get().importingHistory && get().sessions.some((session) => session.id === id)) {
+    const previous = get().activeId
+    if (previous && previous !== id) {
+      void closeSession(previous)
+    }
     touchSession(id)
     set({ activeId: id })
     void ensureSessionLoaded(id)
+    if (!canWrite(id)) {
+      void takeSessionControl(id)
+    }
     trimSessionCache()
   }
 }
 
 export const renameSession = (id: string, title: string) => {
-  if (get().importingHistory || deletingSessions.has(id)) {
+  if (get().importingHistory || deletingSessions.has(id) || !canWrite(id)) {
+    if (!canWrite(id)) {
+      showToast('请打开对话并取得操作权后再重命名')
+    }
     return
   }
   const controller = getStreamController(id)
@@ -494,12 +740,16 @@ const removeSessionData = async (id: string): Promise<boolean> => {
   const epoch = historyEpoch
   deletingSessions.add(id)
   try {
+    if (!canWrite(id)) {
+      await acquireSession(id)
+    }
     getStreamController(id)?.abort()
     // 等本会话的流收尾，避免删除之后又被收尾保存写回来。
     await waitForIdle(id)
     if (epoch !== historyEpoch) {
       return false
     }
+    await deleteCloudSession(id)
     await db.deleteSession(id)
     if (epoch !== historyEpoch) {
       return true
@@ -545,7 +795,19 @@ export const stopReply = (sessionId: string) => getStreamController(sessionId)?.
  * 提交指定会话的最新草稿；null 表示新建会话。
  * 同步接收成功才清空草稿，附件原件由会话接管；保存失败仍通过保存入口重试。
  */
-export const sendMessage = (targetSessionId: string | null) => {
+const sendingDrafts = new Set<string | null>()
+export const sendMessage = async (targetSessionId: string | null) => {
+  if (sendingDrafts.has(targetSessionId)) {
+    return false
+  }
+  sendingDrafts.add(targetSessionId)
+  try {
+    return await sendDraft(targetSessionId)
+  } finally {
+    sendingDrafts.delete(targetSessionId)
+  }
+}
+const sendDraft = async (targetSessionId: string | null) => {
   if (get().importingHistory || !get().ready) {
     return false
   }
@@ -554,6 +816,14 @@ export const sendMessage = (targetSessionId: string | null) => {
     return false
   }
   const { text, files } = prepared
+  const selectedOptions = {
+    ...useSettings.getState(),
+    ...(targetSessionId ? getSession(targetSessionId)?.options : {}),
+  }
+  if (selectedOptions.model !== 'deepseek-flash' && files.length) {
+    showToast('附件对话请选择 Flash 模型')
+    return false
+  }
   const now = Date.now()
   let sessionId = targetSessionId
   if (
@@ -571,6 +841,17 @@ export const sendMessage = (targetSessionId: string | null) => {
       messages: [],
       rootMessageId: null,
     }
+    try {
+      await createCloudSession(session.id)
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : '创建失败')
+      return false
+    }
+    if (get().activeId !== targetSessionId) {
+      await deleteCloudSession(session.id).catch(() => {})
+      await releaseSession(session.id)
+      return false
+    }
     sessionId = session.id
     touchSession(session.id)
     set((state) => ({
@@ -580,7 +861,7 @@ export const sendMessage = (targetSessionId: string | null) => {
     }))
   }
   const current = getSession(sessionId)
-  if (!current) {
+  if (!current || !canWrite(sessionId)) {
     return false
   }
   const history = getVisibleMessages(current)
@@ -617,7 +898,7 @@ export const sendMessage = (targetSessionId: string | null) => {
 
 /** 重新生成当前路径上的回答：在原问题下新增版本，不覆盖旧回答和后续对话。 */
 export const regenerateReply = (sessionId: string, messageId?: string) => {
-  if (get().importingHistory || deletingSessions.has(sessionId)) {
+  if (get().importingHistory || deletingSessions.has(sessionId) || !canWrite(sessionId)) {
     return
   }
   const session = getSession(sessionId)
@@ -643,7 +924,7 @@ export const regenerateReply = (sessionId: string, messageId?: string) => {
 
 /** 编辑提问后新增同父版本，保留原文件；旧问题的所有回答与后续对话仍可切回。 */
 export const editMessage = (sessionId: string, messageId: string, content: string): boolean => {
-  if (get().importingHistory || deletingSessions.has(sessionId)) {
+  if (get().importingHistory || deletingSessions.has(sessionId) || !canWrite(sessionId)) {
     return false
   }
   const session = getSession(sessionId)
@@ -675,7 +956,7 @@ export const editMessage = (sessionId: string, messageId: string, content: strin
 }
 
 export const selectMessageVersion = (sessionId: string, messageId: string) => {
-  if (get().importingHistory || deletingSessions.has(sessionId)) {
+  if (get().importingHistory || deletingSessions.has(sessionId) || !canWrite(sessionId)) {
     return
   }
   if (getStreamController(sessionId)) {
@@ -687,7 +968,7 @@ export const selectMessageVersion = (sessionId: string, messageId: string) => {
 
 /** 继续最后一条未完成的回答：保留原消息与开关，仅将新流的内容追加到原块之后。 */
 export const continueReply = (sessionId: string, messageId: string) => {
-  if (get().importingHistory || deletingSessions.has(sessionId)) {
+  if (get().importingHistory || deletingSessions.has(sessionId) || !canWrite(sessionId)) {
     return
   }
   const session = getSession(sessionId)
@@ -725,7 +1006,7 @@ export const continueReply = (sessionId: string, messageId: string) => {
 
 /** 附件补传失败后重试：保留原回答位置，重新补传并请求 */
 export const retryUpload = (sessionId: string, messageId: string) => {
-  if (get().importingHistory || deletingSessions.has(sessionId)) {
+  if (get().importingHistory || deletingSessions.has(sessionId) || !canWrite(sessionId)) {
     return
   }
   const session = getSession(sessionId)
@@ -961,11 +1242,31 @@ const waitForRetry = (attempt: number, signal: AbortSignal) =>
  */
 const streamReply = async (sessionId: string, initial: AssistantMessage, request: Request) => {
   const controller = new AbortController()
-  if (!getSession(sessionId)?.title) {
+  const options =
+    initial.options ??
+    generationOptions({
+      ...useSettings.getState(),
+      model: initial.model ?? MODEL,
+      thinking: initial.thinking ?? false,
+      search: initial.search ?? false,
+    })
+  if (!getSession(sessionId)?.title && options.autoTitle) {
     titleRequests.add(controller)
   }
   set((state) => ({ streaming: { ...state.streaming, [sessionId]: controller } }))
-  let reply = initial
+  let reply: AssistantMessage = { ...initial, options }
+  const speechSettings = useSettings.getState()
+  const speechError = (error: unknown) =>
+    showToast(error instanceof Error ? error.message : '自动朗读失败')
+  const liveRead =
+    speechSettings.autoRead && speechSettings.streamingRead
+      ? beginStreamingRead(initial.id, speechError)
+      : null
+  const answerText = () =>
+    reply.blocks
+      .filter((b) => b.type === 'text' && !b.isTemplate)
+      .map((b) => (b.type === 'text' ? b.text : ''))
+      .join('\n')
   let frame = 0
   const flush = () => {
     cancelAnimationFrame(frame)
@@ -975,37 +1276,95 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
   streamFlushes.set(sessionId, flush)
 
   try {
+    await renewSession(sessionId)
     for (let attempt = 0; ; attempt += 1) {
       /** 附件补齐前出错属于上传失败，请求还没有发出 */
       let preparing = true
       let receivedContent = false
       try {
-        const prepared = await prepareFiles(sessionId, request, controller.signal)
+        const textOnly = options.model !== 'deepseek-flash'
+        const prepared = textOnly
+          ? {
+              ...request,
+              question: { ...request.question, files: [] },
+              history: request.history.map((m) => (m.role === 'user' ? { ...m, files: [] } : m)),
+            }
+          : await prepareFiles(sessionId, request, controller.signal)
         preparing = false
         // 附件就绪后获取本轮信息；续写沿用原回答快照，重新生成的快照独立保存。
         const latestReminder = prepared.prefix
           ? prepared.prefix.latestReminder
-          : createLatestReminder(useSettings.getState())
+          : options.sendMetadata
+            ? createLatestReminder(useSettings.getState())
+            : undefined
         reply = { ...reply, latestReminder }
         updateReply(sessionId, reply)
         persist(sessionId)
         const messages = toRequestMessages(
-          prepared.history,
+          options.contextRounds
+            ? prepared.history.slice(-options.contextRounds * 2)
+            : prepared.history,
           prepared.question,
           prepared.prefix,
           initial.thinking ?? false,
           latestReminder
         )
+        await renewSession(sessionId)
+        if (controller.signal.aborted) {
+          throw controller.signal.reason
+        }
+        const extended = options.model === 'deepseek-flash'
         const events = streamMessage(
           useSettings.getState().apiKey ?? '',
           {
             model: initial.model ?? MODEL,
-            system: SYSTEM_PROMPT,
-            messages,
+            system: options.systemPrompt,
+            messages: extended
+              ? messages
+              : messages
+                  .filter((message) => message.role !== 'latest_reminder')
+                  .map((message) =>
+                    message.role === 'assistant'
+                      ? {
+                          ...message,
+                          content: message.content.filter((block) => block.type === 'text'),
+                        }
+                      : {
+                          ...message,
+                          content:
+                            typeof message.content === 'string'
+                              ? message.content
+                              : message.content.filter((block) => block.type === 'text'),
+                        }
+                  ),
             thinking: { type: initial.thinking ? 'enabled' : 'disabled' },
-            safety_check: SAFETY_CHECK,
-            tools: serverTools(initial.search ?? false),
-            ...(titleRequests.has(controller) ? { title: { enabled: true } } : {}),
+            ...(extended ? { safety_check: { level: options.safety } } : {}),
+            tools: serverTools(
+              extended && (initial.search ?? false),
+              extended && options.readLinks
+            ),
+            output_config: { effort: options.effort },
+            ...(options.maxTokens ? { max_tokens: options.maxTokens } : {}),
+            ...(!options.thinking &&
+            (!extended ||
+              (!options.search &&
+                !options.readLinks &&
+                options.safety === 'low' &&
+                !options.autoTitle))
+              ? {
+                  temperature: options.temperature,
+                  top_p: options.topP,
+                  ...(options.stopSequences.trim()
+                    ? {
+                        stop_sequences: options.stopSequences
+                          .split('\n')
+                          .filter(Boolean)
+                          .slice(0, 16),
+                      }
+                    : {}),
+                }
+              : {}),
+            ...(extended && titleRequests.has(controller) ? { title: { enabled: true } } : {}),
           },
           controller.signal
         )
@@ -1025,6 +1384,11 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
             titleRequests.delete(controller)
           }
           reply = applyEvent(reply, event, Date.now(), blockIndexes)
+          if (reply.stopReason === 'refusal') {
+            liveRead?.stop()
+          } else {
+            liveRead?.update(answerText())
+          }
           if (document.visibilityState === 'hidden') {
             flush()
           } else {
@@ -1079,7 +1443,21 @@ const streamReply = async (sessionId: string, initial: AssistantMessage, request
         break
       }
     }
+  } catch (error) {
+    reply = settleReply(reply, 'error', Date.now(), {
+      kind: 'network',
+      message: error instanceof Error ? error.message : '操作权已失效',
+    })
   } finally {
+    if (reply.status === 'done' && reply.stopReason !== 'refusal') {
+      if (liveRead) {
+        liveRead.finish()
+      } else if (speechSettings.autoRead && answerText()) {
+        toggleReadAloud(reply.id, answerText(), speechError)
+      }
+    } else {
+      liveRead?.stop()
+    }
     titleRequests.delete(controller)
     streamFlushes.delete(sessionId)
     cancelAnimationFrame(frame)

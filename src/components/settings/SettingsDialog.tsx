@@ -1,3 +1,7 @@
+import { AdvancedSettings } from './AdvancedSettings.js'
+import { Toolbox } from './Toolbox.js'
+import { HistoryProgress } from './HistoryProgress.js'
+import { useHistoryProgress } from '../../services/chat/history/progress.js'
 import clsx from 'clsx'
 import { useRef, useState, type ReactNode } from 'react'
 import {
@@ -45,12 +49,18 @@ export const SettingsDialog = () => {
   return open ? <SettingsContent /> : null
 }
 
-const sections: { value: SettingsSection; label: TranslationKey; icon: ReactNode }[] = [
+const sections: {
+  value: SettingsSection
+  label: TranslationKey | '对话参数' | '工具箱'
+  icon: ReactNode
+}[] = [
   {
     value: 'general',
     label: 'settingDialogAsideGeneralOptionLabel',
     icon: <IconSettingsOutline16 />,
   },
+  { value: 'advanced', label: '对话参数', icon: <IconSettingsOutline16 /> },
+  { value: 'tools', label: '工具箱', icon: <IconSettingsOutline16 /> },
   { value: 'data', label: 'settingDialogAsideDataOptionLabel', icon: <IconDataOutline16 /> },
 ]
 
@@ -89,12 +99,18 @@ const SettingsContent = () => {
               onClick={() => setSection(item.value)}
             >
               {item.icon}
-              {t(item.label)}
+              {item.value === 'advanced' || item.value === 'tools'
+                ? item.label
+                : t(item.label as TranslationKey)}
             </button>
           ))}
         </div>
         <div role="tabpanel" className={styles.content}>
-          {section === 'general' ? (
+          {section === 'advanced' ? (
+            <AdvancedSettings />
+          ) : section === 'tools' ? (
+            <Toolbox />
+          ) : section === 'general' ? (
             <>
               <ThemeSetting />
               <LocaleSetting />
@@ -104,6 +120,7 @@ const SettingsContent = () => {
           ) : (
             <>
               <ApiKeyField editor={apiKeyEditor} />
+              <HistoryProgress />
               <ImportHistory historyImport={historyImport} disabled={historyBusy} />
               <ExportHistory disabled={historyBusy} />
               <SettingCell
@@ -184,8 +201,8 @@ const useHistoryDelete = () => {
       await clearHistory()
       setOpened(false)
       showToast({ key: 'historyDeleted' })
-    } catch {
-      showToast({ key: 'historyDeleteFailed', type: 'error' })
+    } catch (error) {
+      showToast(error instanceof Error ? error.message : '删除失败，请重试')
     } finally {
       deleting.current = false
       setBusy(false)
@@ -337,7 +354,10 @@ const ImportConfirm = ({
         </>
       }
     >
-      <div className={styles.importConfirmText}>{t('historyImportConfirmDescription')}</div>
+      <div className={styles.importConfirmText}>
+        对话将追加到云端，完全相同的已导入对话会自动跳过。导入支持暂停、刷新后继续，并显示实时进度。
+        选择新备份会替换尚未完成的本地导入任务，已同步的对话仍会保留。备份不含 API Key。
+      </div>
     </Modal>
   )
 }
@@ -453,9 +473,15 @@ const useHistoryImport = () => {
     setStatus(null)
     try {
       const count = await importHistory(file)
-      setStatus({ key: count === 1 ? 'historyImportedOne' : 'historyImported', params: { count } })
-    } catch {
+      if (useHistoryProgress.getState().phase === 'done') {
+        setStatus({
+          key: count === 1 ? 'historyImportedOne' : 'historyImported',
+          params: { count },
+        })
+      }
+    } catch (error) {
       setStatus({ key: 'historyImportFailed', error: true })
+      showToast(error instanceof Error ? error.message : '导入失败')
     } finally {
       importing.current = false
       setBusy(false)
@@ -479,7 +505,7 @@ const ImportHistory = ({
   return (
     <SettingCell
       label={t('historyImport')}
-      description={t('historyImportDescription')}
+      description="支持 DeepSeek / Demo ZIP、本站完整备份和本地恢复 JSON；追加到云端。"
       status={historyImport.status}
       action={
         <>
@@ -496,7 +522,7 @@ const ImportHistory = ({
           <input
             ref={inputRef}
             type="file"
-            accept=".zip,application/zip,application/x-zip-compressed"
+            accept=".zip,.json,application/zip,application/json"
             hidden
             onChange={(event) => {
               const file = event.target.files?.[0]
@@ -523,7 +549,10 @@ const ExportHistory = ({ disabled }: { disabled: boolean }) => {
     setBusy(true)
     setStatus(null)
     try {
-      const { name, blob } = await exportHistory()
+      const { name, blob, missing } = await exportHistory()
+      if (missing) {
+        showToast(`备份中有 ${missing} 个附件没有原件，已在清单中标记`)
+      }
       const url = URL.createObjectURL(blob)
       const link = document.createElement('a')
       link.href = url
@@ -540,7 +569,7 @@ const ExportHistory = ({ disabled }: { disabled: boolean }) => {
   return (
     <SettingCell
       label={t('exportAllLabel')}
-      description={t('historyExportDescription')}
+      description="导出全部对话分支、请求参数、设置和已同步的原附件（不含 API Key）。"
       status={status}
       action={
         <Button

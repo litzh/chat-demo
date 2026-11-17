@@ -1,0 +1,22 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "dsh-chat",
+  "pages_build_output_dir": "./dist",
+  "compatibility_date": "2026-11-17",
+  "vars": {
+    "AUTH_MODE": "access",
+    "APP_ORIGIN": "https://chat.example.com",
+    "ACCESS_TEAM_DOMAIN": "your-team.cloudflareaccess.com",
+    "ACCESS_AUD": "REPLACE_WITH_ACCESS_APPLICATION_AUD",
+    "ACCESS_EMAIL": "owner@example.com",
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "dsh-chat",
+      "database_id": "00000000-0000-0000-0000-000000000000",
+      "migrations_dir": "migrations",
+    },
+  ],
+  "r2_buckets": [{ "binding": "FILES", "bucket_name": "dsh-chat-files" }],
+}

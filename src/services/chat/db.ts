@@ -1,8 +1,19 @@
 import { openDB, type DBSchema, type IDBPDatabase } from 'idb'
 import { toSessionSummary, type Session, type SessionSummary } from './types.js'
+import { downloadCloudFile } from '../cloud/client.js'
 
 /** IndexedDB 存储结构版本；新增或调整存储、索引时递增。 */
-const DB_VERSION = 11
+const DB_VERSION = 13
+
+export type ImportCheckpoint = {
+  id: 'current'
+  name: string
+  total: number
+  completedIds: string[]
+  skipped: number
+  ready: boolean
+  preferences?: Record<string, unknown>
+}
 
 /** 文件原件按附件的本地 id 存储，所有引用同一 id 的消息共用一份；用于缩略图、打开查看，以及没有 serverId 时补传。 */
 export type StoredFile = {
@@ -23,6 +34,8 @@ interface ChatDB extends DBSchema {
   }
   /** 当前使用的文件原件 */
   files: { key: string; value: StoredFile }
+  recovery: { key: string; value: Session }
+  importJobs: { key: string; value: ImportCheckpoint }
   /**
    * 历史导入的暂存：导入过程中会话与原件只写入这两个存储，`sessions` / `files` 保持不变；
    * 全部校验通过后在一个事务中替换正式数据并清空暂存，失败时只清空暂存。
@@ -57,7 +70,14 @@ const getDB = () =>
   (dbPromise ??= openDB<ChatDB>('chat-demo', DB_VERSION, {
     upgrade(db, _oldVersion, _newVersion, tx) {
       // 初始化当前格式需要的存储与索引，不迁移旧消息。
-      for (const name of ['sessions', 'files', 'sessionsStaging', 'filesStaging'] as const) {
+      for (const name of [
+        'sessions',
+        'files',
+        'sessionsStaging',
+        'filesStaging',
+        'recovery',
+        'importJobs',
+      ] as const) {
         if (!db.objectStoreNames.contains(name)) {
           db.createObjectStore(name, { keyPath: 'id' })
         }
@@ -154,15 +174,54 @@ const putFiles = async (store: 'files' | 'filesStaging', files: StoredFile[]) =>
 
 export const saveFiles = (files: StoredFile[]): Promise<void> => putFiles('files', files)
 
-export const loadFile = async (id: string): Promise<Blob | undefined> =>
+export const loadLocalFile = async (id: string): Promise<Blob | undefined> =>
   (await (await getDB()).get('files', id))?.blob
+
+export const loadFile = async (id: string): Promise<Blob | undefined> => {
+  const local = await loadLocalFile(id)
+  if (local) {
+    return local
+  }
+  const remote = await downloadCloudFile(id)
+  if (remote) {
+    await saveFiles([{ id, blob: remote }])
+  }
+  return remote
+}
+
+export const saveRecovery = async (session: Session) => {
+  await (await getDB()).put('recovery', session)
+}
+export const clearRecovery = async (id: string) => {
+  await (await getDB()).delete('recovery', id)
+}
+export const loadRecoveries = async () => (await getDB()).getAll('recovery')
+export const saveSummaries = async (summaries: SessionSummary[]) => {
+  const db = await getDB()
+  const tx = db.transaction('sessionSummaries', 'readwrite')
+  const ids = new Set(summaries.map((s) => s.id))
+  for (const id of await tx.store.getAllKeys()) {
+    if (!ids.has(id)) {
+      await tx.store.delete(id)
+    }
+  }
+  for (const summary of summaries) {
+    const previous = await tx.store.get(summary.id)
+    await tx.store.put({ ...summary, fileIds: previous?.fileIds ?? [] })
+  }
+  await tx.done
+}
 
 /** 清空导入暂存：开始导入前清除上次中断（如关闭页面）遗留的数据，导入失败后清除本次写入。 */
 export const clearStaging = async (): Promise<void> => {
-  const tx = (await getDB()).transaction(['sessionsStaging', 'filesStaging'], 'readwrite')
+  const tx = (await getDB()).transaction(
+    ['sessionsStaging', 'filesStaging', 'importJobs'],
+    'readwrite'
+  )
   await Promise.all([
     tx.objectStore('sessionsStaging').clear(),
     tx.objectStore('filesStaging').clear(),
+    tx.objectStore('importJobs').clear(),
     tx.done,
   ])
 }
@@ -249,3 +308,24 @@ export const reportStorageError = (action: string) => (error: unknown) => {
   // eslint-disable-next-line no-console
   console.error(`[storage] ${action} failed`, error)
 }
+
+export const loadStagingSessions = async () => (await getDB()).getAll('sessionsStaging')
+export const stagingSessionIds = async () => (await getDB()).getAllKeys('sessionsStaging')
+export const loadStagingSession = async (id: string) => (await getDB()).get('sessionsStaging', id)
+export const saveImportCheckpoint = async (job: ImportCheckpoint) =>
+  (await getDB()).put('importJobs', job)
+export const loadImportCheckpoint = async () => (await getDB()).get('importJobs', 'current')
+export const completeImportItems = async (ids: string[], skippedIds: string[]) => {
+  const tx = (await getDB()).transaction('importJobs', 'readwrite')
+  const job = await tx.store.get('current')
+  if (!job) {
+    throw new Error('导入暂存已丢失，请重新选择备份')
+  }
+  job.skipped += skippedIds.filter((id) => !job.completedIds.includes(id)).length
+  job.completedIds = [...new Set([...job.completedIds, ...ids])]
+  await tx.store.put(job)
+  await tx.done
+  return job
+}
+export const loadStagingFile = async (id: string) =>
+  (await (await getDB()).get('filesStaging', id))?.blob
